@@ -186,7 +186,7 @@ if {[opt-bool ipv6 full]} {
     define JIM_IPV6
 }
 if {[opt-bool tls full]} {
-    if {[cc-check-includes ssl/ssl.h] && [cc-check-function-in-lib ssl_ctx_new axtls]} {
+    if {[have-feature pipe] && [cc-check-includes ssl/ssl.h] && [cc-check-function-in-lib ssl_ctx_new axtls]} {
         msg-result "Enabling TLS"
         define JIM_TLS
         define-append LDLIBS [get-define lib_ssl_ctx_new]

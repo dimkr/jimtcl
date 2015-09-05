@@ -129,7 +129,9 @@ typedef struct AioFile
     Jim_Obj *eEvent;
     int addr_family;
 #if TLS
-    SSL *tls;
+    SSL *tls_out;
+    int tls_in_wr;
+    FILE *tls_in_r;
     int tls_err;
 #endif
 } AioFile;
@@ -346,6 +348,18 @@ static void JimAioDelProc(Jim_Interp *interp, void *privData)
         fclose(af->fp);
     }
 
+    if (af->tls_in_wr > 0) {
+        close(af->tls_in_wr);
+    }
+
+    if (af->tls_in_r != NULL) {
+        fclose(af->tls_in_r);
+    }
+
+    if (af->tls_out) {
+        ssl_free(af->tls_out);
+    }
+
     Jim_Free(af);
 }
 
@@ -488,9 +502,10 @@ static int aio_cmd_gets(Jim_Interp *interp, int argc, Jim_Obj *const *argv)
     AioFile *af = Jim_CmdPrivData(interp);
     char buf[AIO_BUF_LEN];
     Jim_Obj *objPtr;
+    FILE *fp;
 #if TLS
-    uint8_t *out;
-    int status;
+    uint8_t *tbuf;
+    int status, out, tot;
 #endif
     int len;
 
@@ -498,11 +513,11 @@ static int aio_cmd_gets(Jim_Interp *interp, int argc, Jim_Obj *const *argv)
 
     objPtr = Jim_NewStringObj(interp, NULL, 0);
 #if TLS
-    if (af->tls != NULL) {
+    if (af->tls_out != NULL) {
         /* wait for the handshake to complete - ssl_read() returns 0 until
          * then */
         do {
-           len = ssl_read(af->tls, &out);
+            len = ssl_read(af->tls_out, &tbuf);
             if (len < 0) {
                 af->tls_err = len;
                 goto io_err;
@@ -512,46 +527,47 @@ static int aio_cmd_gets(Jim_Interp *interp, int argc, Jim_Obj *const *argv)
             }
         } while (len <= 0);
 
-        status = ssl_handshake_status(af->tls);
+        status = ssl_handshake_status(af->tls_out);
         if (status != SSL_OK) {
             af->tls_err = status;
             goto io_err;
         }
 
-        if (out[len - 1] == '\0' && out[len - 2] != '\n') {
-            Jim_AppendString(interp, objPtr, (const char*)out, len - 1);
-        }
-        else {
-            if (out[len - 1] == '\n') {
-                /* strip "\n" */
-                len--;
+        tot = 0;
+        do {
+            out = write(af->tls_in_wr, tbuf + tot, (size_t)len - tot);
+            if (out < 0) {
+                goto io_err;
             }
 
-            Jim_AppendString(interp, objPtr, (const char*)out, len);
-        }
+            tot += out;
+        } while (tot != len);
+
+        fp = af->tls_in_r;
     } else {
 #else
     if (1) {
 #endif
-        while (1) {
-            buf[AIO_BUF_LEN - 1] = '_';
-            if (fgets(buf, AIO_BUF_LEN, af->fp) == NULL)
-                break;
+        fp = af->fp;
+    }
+    while (1) {
+        buf[AIO_BUF_LEN - 1] = '_';
+        if (fgets(buf, AIO_BUF_LEN, fp) == NULL)
+            break;
 
-            if (buf[AIO_BUF_LEN - 1] == '\0' && buf[AIO_BUF_LEN - 2] != '\n') {
-                Jim_AppendString(interp, objPtr, buf, AIO_BUF_LEN - 1);
+        if (buf[AIO_BUF_LEN - 1] == '\0' && buf[AIO_BUF_LEN - 2] != '\n') {
+            Jim_AppendString(interp, objPtr, buf, AIO_BUF_LEN - 1);
+        }
+        else {
+            len = strlen(buf);
+
+            if (len && (buf[len - 1] == '\n')) {
+                /* strip "\n" */
+                len--;
             }
-            else {
-                len = strlen(buf);
 
-                if (len && (buf[len - 1] == '\n')) {
-                    /* strip "\n" */
-                    len--;
-                }
-
-                Jim_AppendString(interp, objPtr, buf, len);
-                break;
-            }
+            Jim_AppendString(interp, objPtr, buf, len);
+            break;
         }
     }
 #if TLS
@@ -571,7 +587,7 @@ io_err:
 
         len = Jim_Length(objPtr);
 
-        if (len == 0 && feof(af->fp)) {
+        if (len == 0 && feof(fp)) {
             /* On EOF returns -1 if varName was specified */
             len = -1;
         }
@@ -605,14 +621,14 @@ static int aio_cmd_puts(Jim_Interp *interp, int argc, Jim_Obj *const *argv)
 
     wdata = Jim_GetString(strObj, &wlen);
 #if TLS
-    if (af->tls != NULL) {
-        out = ssl_write(af->tls, (const uint8_t*)wdata, wlen);
+    if (af->tls_out != NULL) {
+        out = ssl_write(af->tls_out, (const uint8_t*)wdata, wlen);
         if (out == wlen) {
             if (argc == 2) {
                 return JIM_OK;
             }
 
-            out = ssl_write(af->tls, (const uint8_t*)"\n", 1);
+            out = ssl_write(af->tls_out, (const uint8_t*)"\n", 1);
             if (out == 1) {
                 return JIM_OK;
             }
@@ -1007,7 +1023,7 @@ static int aio_cmd_tls(Jim_Interp *interp, int argc, Jim_Obj *const *argv)
     }
 
     sprintf(buf, "aio.tlsstream%ld", Jim_GetId(interp));
-    return JimMakeChannel(interp, NULL, af->fd, Jim_NewStringObj(interp, buf, -1), buf, af->addr_family, "r+", tls);
+    return JimMakeChannel(interp, NULL, fd, Jim_NewStringObj(interp, buf, -1), buf, af->addr_family, "r+", tls);
 }
 #endif
 
@@ -1240,7 +1256,6 @@ static int JimMakeChannel(Jim_Interp *interp, FILE *fh, int fd, Jim_Obj *filenam
     AioFile *af;
     char buf[AIO_CMD_LEN];
     int openFlags = 0;
-
 #if !TLS
     JIM_NOTUSED(tls);
 #endif
@@ -1287,7 +1302,31 @@ static int JimMakeChannel(Jim_Interp *interp, FILE *fh, int fd, Jim_Obj *filenam
     af->openFlags = openFlags;
     af->addr_family = family;
 #if TLS
-    af->tls = tls;
+    af->tls_out = tls;
+    if (tls == NULL) {
+        af->tls_in_r = NULL;
+        af->tls_in_wr = -1;
+    } else {
+        int fds[2];
+
+        if (0 > pipe(fds)) {
+            JimAioSetError(interp, filename);
+            Jim_DecrRefCount(interp, filename);
+            Jim_Free(af);
+        }
+
+        af->tls_in_r = fdopen(fds[0], "r");
+        if (af->tls_in_r == NULL) {
+            close(fds[1]);
+            close(fds[0]);
+            JimAioSetError(interp, filename);
+            Jim_DecrRefCount(interp, filename);
+            Jim_Free(af);
+            return JIM_ERR;
+        }
+        setbuf(af->tls_in_r, NULL);
+        af->tls_in_wr = fds[1];
+    }
     af->tls_err = 0;
 #endif
     snprintf(buf, sizeof(buf), hdlfmt, Jim_GetId(interp));
